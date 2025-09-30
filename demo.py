@@ -1,116 +1,168 @@
-import streamlit as st
+import time
+import numpy as np
 import pandas as pd
 import pydeck as pdk
-import numpy as np
-import time
+import streamlit as st
 
-st.title("✈️ Flight Radar with Animated Pulses")
+from typing import List, Dict, Any
 
-# ----- ROUTES -----
-routes = [
+from utils import (
+    fetch_live_flights,
+    fetch_sigmet_geojson,
+    routes_to_linestrings,
+    route_buffers,
+    hazards_intersecting_route,
+    flights_to_layer,
+    sigmet_geojson_layer,
+    sigmet_pulse_layers,
+)
+
+# --------------------
+# CONSTANTS / CONFIG
+# --------------------
+N_POINTS = 100
+CYCLE_DURATION_MS = 3000
+FRAME_RATE = 30
+SLEEP_TIME = 1 / FRAME_RATE
+PLANE_SPEED_FACTOR = 2
+
+ROUTE_COLOR = [0, 150, 255]
+PLANE_COLOR = [255, 255, 255]
+PLANE_RADIUS = 25000
+ARC_WIDTH = 3
+
+VIEW_LAT = 22
+VIEW_LON = 78
+VIEW_ZOOM = 5
+VIEW_PITCH = 30
+
+ROUTES = [
     {"from": [77.1, 28.6], "to": [72.87, 19.07]},  # Delhi → Mumbai
     {"from": [77.1, 28.6], "to": [77.59, 12.97]},  # Delhi → Bengaluru
-    {"from": [77.59, 12.97], "to": [88.36, 22.57]} # Bengaluru → Kolkata
+    {"from": [77.59, 12.97], "to": [88.36, 22.57]},  # Bengaluru → Kolkata
 ]
 
-n_points = 100
+# --------------------
+# HELPERS
+# --------------------
+def precompute_route_points(routes: List[Dict]) -> List[pd.DataFrame]:
+    route_points = []
+    for route in routes:
+        lons = np.linspace(route["from"][0], route["to"][0], N_POINTS)
+        lats = np.linspace(route["from"][1], route["to"][1], N_POINTS)
+        route_points.append(pd.DataFrame({"lon": lons, "lat": lats}))
+    return route_points
+# Precomputing reduces per-frame overhead for animation [web:11].
 
-# ----- RADAR ANOMALIES (with severity) -----
-radar_anomalies = [
-    {"lon": 76.0, "lat": 23.5, "severity": 1, "color": [255, 255, 0]},  # Minimal - yellow
-    {"lon": 78.0, "lat": 22.0, "severity": 2, "color": [255, 165, 0]},  # Medium - orange
-    {"lon": 80.0, "lat": 21.0, "severity": 3, "color": [255, 0, 0]},    # Severe - red
-]
-
-# Map severity to maximum radius
-severity_radius = {1: 150000, 2: 250000, 3: 400000}
-
-# Placeholder for updating chart
-chart_placeholder = st.empty()
-
-# ----- ANIMATION LOOP -----
-while True:
-    t = (time.time() * 1000) % 3000  # 3-second cycle
-    scale = t / 3000
-
-    route_layers = []
-    plane_layers = []
-    pulse_layers = []
-
-    # --- ROUTES & PLANES ---
-    for r in routes:
-        lons = np.linspace(r["from"][0], r["to"][0], n_points)
-        lats = np.linspace(r["from"][1], r["to"][1], n_points)
-        route_points = pd.DataFrame({"lon": lons, "lat": lats})
-
-        # Plane position
-        frame = int(time.time() * 2 % n_points)
-        plane_pos = route_points.iloc[frame:frame+1]
-
-        # Arc layer
-        route_layers.append(
+def get_route_layers(routes: List[Dict]) -> List[pdk.Layer]:
+    layers = []
+    for route in routes:
+        df = pd.DataFrame([{
+            "from_lon": route["from"][0], "from_lat": route["from"][1],
+            "to_lon": route["to"][0], "to_lat": route["to"][1]
+        }])
+        layers.append(
             pdk.Layer(
                 "ArcLayer",
-                data=pd.DataFrame([{
-                    "from_lon": r["from"][0], "from_lat": r["from"][1],
-                    "to_lon": r["to"][0], "to_lat": r["to"][1]
-                }]),
+                data=df,
                 get_source_position='[from_lon, from_lat]',
                 get_target_position='[to_lon, to_lat]',
-                get_source_color=[0, 150, 255],
-                get_target_color=[0, 150, 255],
-                get_width=3
+                get_source_color=ROUTE_COLOR,
+                get_target_color=ROUTE_COLOR,
+                get_width=ARC_WIDTH
             )
         )
+    return layers
+# ArcLayer draws clean curves between origin and destination points [web:11].
 
-        # Plane moving along route
-        plane_layers.append(
+def get_plane_layers(route_points: List[pd.DataFrame]) -> List[pdk.Layer]:
+    layers = []
+    now = time.time()
+    for points in route_points:
+        frame = int(now * PLANE_SPEED_FACTOR % N_POINTS)
+        plane_pos = points.iloc[frame:frame+1]
+        layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
                 data=plane_pos,
                 get_position='[lon, lat]',
-                get_fill_color=[255, 255, 255],
-                get_radius=25000
+                get_fill_color=PLANE_COLOR,
+                get_radius=PLANE_RADIUS
             )
         )
+    return layers
+# White markers simulate planes moving along routes frame-by-frame [web:11].
 
-    # --- RADAR PULSES (Severity-based, concentric, animated) ---
-    for anomaly in radar_anomalies:
-        max_radius = severity_radius.get(anomaly["severity"], 150000)
-        for i in range(3):  # 3 concentric circles
-            radius = max_radius * (scale + i * 0.2)
-            if radius > max_radius:
-                radius = radius - max_radius
-            # Higher severity => more opacity
-            opacity = int(100 + 50 * anomaly["severity"] * (1 - scale - i * 0.2))
-            if opacity < 0: opacity = 0
+# --------------------
+# STREAMLIT APP
+# --------------------
+st.set_page_config(page_title="Flight Radar + SIGMETs", layout="wide")
+st.title("✈️ Flight Radar with Live SIGMET Hazards")
 
-            pulse_layers.append(
-                pdk.Layer(
-                    "ScatterplotLayer",
-                    data=pd.DataFrame([{"lon": anomaly["lon"], "lat": anomaly["lat"]}]),
-                    get_position='[lon, lat]',
-                    get_fill_color=anomaly["color"] + [opacity],
-                    get_radius=radius,
-                    stroked=False,
-                    filled=True,
-                )
-            )
+# Sidebar controls
+col1, col2 = st.columns(2)
+with col1:
+    flights_limit = st.slider("Max flights", 10, 200, 50, 10)
+with col2:
+    buffer_km = st.slider("Route buffer (km)", 20, 150, 60, 10)
 
-    # ----- VIEW -----
-    view_state = pdk.ViewState(
-        latitude=22,
-        longitude=78,
-        zoom=5,
-        pitch=30
-    )
+# Initial data fetch (cached with TTL inside utils)
+with st.spinner("Fetching hazards and flights..."):
+    sigmet_geo = fetch_sigmet_geojson()
+    live_flights = fetch_live_flights({"limit": flights_limit})
+# AWC Data API provides SIGMET GeoJSON, and AviationStack provides live flights [web:60][web:90].
 
-    # Combine all layers
-    deck = pdk.Deck(
-        layers=route_layers + plane_layers + pulse_layers,
-        initial_view_state=view_state
-    )
+# Geometry for relevance filter
+route_lines = routes_to_linestrings(ROUTES)
+buffers = route_buffers(route_lines, km=buffer_km)
+sigmet_hits = hazards_intersecting_route(sigmet_geo, buffers)
+hit_collection = {"type": "FeatureCollection", "features": sigmet_hits}
+# Intersecting filters ensure only relevant hazards near the route corridor render [web:60].
 
-    # Render chart
-    chart_placeholder.pydeck_chart(deck)
-    time.sleep(0.03)  # ~30 FPS
+# Build layers
+route_layers = get_route_layers(ROUTES)
+plane_traces = precompute_route_points(ROUTES)
+plane_layers = get_plane_layers(plane_traces)
+hazard_layer = sigmet_geojson_layer(hit_collection)
+flights_layer = flights_to_layer(live_flights)
+# GeoJsonLayer renders polygons, ScatterplotLayer renders points for flights/planes [web:11].
+
+# Animation placeholder
+chart_placeholder = st.empty()
+
+# NOTE: Keep API calls out of the animation loop; only animate local layers
+# Streamlit reruns the script on each interaction; an infinite loop is acceptable here
+# for a demo, but consider using st.autorefresh pattern for production [web:92].
+
+try:
+    while True:
+        t = (time.time() * 1000) % CYCLE_DURATION_MS
+        scale = t / CYCLE_DURATION_MS
+
+        pulse_layers = sigmet_pulse_layers(sigmet_hits, scale)
+
+        view_state = pdk.ViewState(
+            latitude=VIEW_LAT,
+            longitude=VIEW_LON,
+            zoom=VIEW_ZOOM,
+            pitch=VIEW_PITCH
+        )
+
+        layers = []
+        layers += route_layers
+        layers += plane_layers
+        if flights_layer:
+            layers.append(flights_layer)
+        if hazard_layer:
+            layers.append(hazard_layer)
+        layers += pulse_layers
+
+        deck = pdk.Deck(
+            layers=layers,
+            initial_view_state=view_state,
+            map_style=None  # choose default or a style of choice
+        )
+        chart_placeholder.pydeck_chart(deck)
+        time.sleep(1 / FRAME_RATE)
+except Exception as e:
+    st.error(f"Animation error: {e}")
